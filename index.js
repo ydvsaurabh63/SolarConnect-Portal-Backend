@@ -612,15 +612,15 @@ app.get('/api/next-id', async (req, res) => {
 // ---------------------------------------------------------------------------
 app.post('/api/auth/login', async (req, res) => {
   try {
-    const { email, password, role } = req.body;
-    const loginIdentifier = (email || '').toLowerCase().trim();
+    const { email, username, identifier, mobile, password, role } = req.body;
+    const loginIdentifier = (email || username || identifier || mobile || '').toLowerCase().trim();
 
     if (!loginIdentifier) {
-      return res.status(400).json({ success: false, message: 'Email, Mobile or Consumer ID is required.' });
+      return res.status(400).json({ success: false, message: 'Email, Username, Mobile, Consumer ID, or Agent Code is required.' });
     }
 
     // 1. Check if user is Super Admin defined in .env
-    if (loginIdentifier === SUPERADMIN_EMAIL) {
+    if (loginIdentifier === SUPERADMIN_EMAIL || loginIdentifier === 'sa-01') {
       if (password !== SUPERADMIN_PASSWORD) {
         return res.status(401).json({ success: false, message: 'Incorrect password for Super Admin.' });
       }
@@ -651,6 +651,8 @@ app.post('/api/auth/login', async (req, res) => {
           { mobile: loginIdentifier },
           { consumerNo: { $regex: new RegExp(`^${loginIdentifier}$`, 'i') } },
           { registrationId: { $regex: new RegExp(`^${loginIdentifier}$`, 'i') } },
+          { code: { $regex: new RegExp(`^${loginIdentifier}$`, 'i') } },
+          { executiveId: { $regex: new RegExp(`^${loginIdentifier}$`, 'i') } },
         ],
       });
     } else {
@@ -659,11 +661,15 @@ app.post('/api/auth/login', async (req, res) => {
         const uMob = (u.mobile || '').toLowerCase();
         const uCons = (u.consumerNo || '').toLowerCase();
         const uReg = (u.registrationId || '').toLowerCase();
+        const uCode = (u.code || '').toLowerCase();
+        const uExec = (u.executiveId || '').toLowerCase();
         return (
           uEmail === loginIdentifier ||
           uMob === loginIdentifier ||
           uCons === loginIdentifier ||
-          uReg === loginIdentifier
+          uReg === loginIdentifier ||
+          uCode === loginIdentifier ||
+          uExec === loginIdentifier
         );
       });
     }
@@ -785,7 +791,7 @@ app.get('/api/users', async (req, res) => {
       });
     }
 
-    res.json({ success: true, users: list });
+    res.json({ success: true, count: list.length, users: list });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Failed to fetch users.' });
   }
@@ -1099,6 +1105,7 @@ app.post('/api/users/reset-consumer-password', async (req, res) => {
       const user = await User.findOne({
         role: 'user',
         $or: [
+          { email: trimmedId.toLowerCase() },
           { consumerNo: trimmedId },
           { mobile: trimmedId },
           { registrationId: trimmedId },
@@ -1588,7 +1595,7 @@ app.get('/api/submission-log', async (req, res) => {
       });
     }
 
-    res.json({ success: true, count: list.length, records: list });
+    res.json({ success: true, count: list.length, records: list, submissionLog: list, registrations: list });
   } catch (err) {
     res.status(500).json({ success: false, message: 'Failed to fetch application records.' });
   }
@@ -1672,6 +1679,29 @@ app.put('/api/registrations/:id', async (req, res) => {
   } catch (err) {
     console.error('Error in PUT /api/registrations/:id:', err);
     res.status(500).json({ success: false, message: 'Failed to update application.' });
+  }
+});
+
+app.delete('/api/registrations/:id', async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (dbConnected) {
+      const deleted = await Application.findOneAndDelete(buildAppQuery(id));
+      if (!deleted) {
+        return res.status(404).json({ success: false, message: 'Application record not found.' });
+      }
+      return res.json({ success: true, message: 'Application deleted successfully.' });
+    } else {
+      const idx = inMemoryRegistrations.findIndex((r) => r._id === id || r.registrationId === id);
+      if (idx === -1) {
+        return res.status(404).json({ success: false, message: 'Application record not found.' });
+      }
+      inMemoryRegistrations.splice(idx, 1);
+      return res.json({ success: true, message: 'Application deleted successfully.' });
+    }
+  } catch (err) {
+    console.error('Error in DELETE /api/registrations/:id:', err);
+    res.status(500).json({ success: false, message: 'Failed to delete application record.' });
   }
 });
 
@@ -1846,6 +1876,17 @@ app.post('/api/registrations/:id/distributor-verify', async (req, res) => {
           'financingDetails.status': 'Pending',
         };
 
+        if (req.body.documentAudits && typeof req.body.documentAudits === 'object') {
+          for (const [docKey, auditVal] of Object.entries(req.body.documentAudits)) {
+            if (auditVal && auditVal.status) {
+              updateData[`documents.${docKey}.status`] = auditVal.status;
+              if (auditVal.remarks) {
+                updateData[`documents.${docKey}.remarks`] = auditVal.remarks;
+              }
+            }
+          }
+        }
+
         if (dbConnected) {
           const updated = await Application.findOneAndUpdate(
             { _id: appRecord._id },
@@ -1905,6 +1946,17 @@ app.post('/api/registrations/:id/distributor-verify', async (req, res) => {
           'verification.status': 'Verified',
           'verification.remarks': 'Documents checked & verified by Distributor. Forwarded to Admin Desk for final sanction.',
         };
+
+        if (req.body.documentAudits && typeof req.body.documentAudits === 'object') {
+          for (const [docKey, auditVal] of Object.entries(req.body.documentAudits)) {
+            if (auditVal && auditVal.status) {
+              updateData[`documents.${docKey}.status`] = auditVal.status;
+              if (auditVal.remarks) {
+                updateData[`documents.${docKey}.remarks`] = auditVal.remarks;
+              }
+            }
+          }
+        }
 
         if (dbConnected) {
           const updated = await Application.findOneAndUpdate(
@@ -2268,6 +2320,12 @@ app.patch('/api/registrations/:id/finance-verify', async (req, res) => {
       'financingDetails.financerName': financerName || 'SBI',
     };
 
+    if (status === 'Approved') {
+      update.overallStatus = 'Finance_Approved';
+    } else if (status === 'Rejected') {
+      update.overallStatus = 'Finance_Rejected';
+    }
+
     if (dbConnected) {
       const rec = await Application.findOneAndUpdate(
         buildAppQuery(id),
@@ -2277,14 +2335,18 @@ app.patch('/api/registrations/:id/finance-verify', async (req, res) => {
       return res.json({ success: true, message: `Loan status updated to ${status}`, record: rec });
     } else {
       const idx = inMemoryRegistrations.findIndex((r) => r._id === id || r.registrationId === id);
-      inMemoryRegistrations[idx].financingDetails = {
-        ...inMemoryRegistrations[idx].financingDetails,
-        status: status || 'Approved',
-        loanAmount: Number(loanAmount) || 0,
-        remarks: remarks || '',
-        financerId: financerId || '',
-        financerName: financerName || 'SBI',
-      };
+      if (idx !== -1) {
+        inMemoryRegistrations[idx].financingDetails = {
+          ...inMemoryRegistrations[idx].financingDetails,
+          status: status || 'Approved',
+          loanAmount: Number(loanAmount) || 0,
+          remarks: remarks || '',
+          financerId: financerId || '',
+          financerName: financerName || 'SBI',
+        };
+        if (status === 'Approved') inMemoryRegistrations[idx].overallStatus = 'Finance_Approved';
+        else if (status === 'Rejected') inMemoryRegistrations[idx].overallStatus = 'Finance_Rejected';
+      }
       return res.json({ success: true, message: `Loan status updated to ${status}`, record: inMemoryRegistrations[idx] });
     }
   } catch (err) {
@@ -2340,6 +2402,7 @@ app.patch('/api/registrations/:id/installer-complete', async (req, res) => {
       'installerDetails.serialNumbers': serialNumbers || '',
       'installerDetails.proofPhoto': proofPhoto || '',
       'verification.status': 'Done',
+      overallStatus: 'Installation_Complete',
     };
 
     if (dbConnected) {
@@ -2351,11 +2414,16 @@ app.patch('/api/registrations/:id/installer-complete', async (req, res) => {
       return res.json({ success: true, message: 'Installation marked Completed!', record: rec });
     } else {
       const idx = inMemoryRegistrations.findIndex((r) => r._id === id || r.registrationId === id);
-      inMemoryRegistrations[idx].installerDetails.status = 'Completed';
-      inMemoryRegistrations[idx].installerDetails.completedAt = new Date();
-      inMemoryRegistrations[idx].installerDetails.serialNumbers = serialNumbers || '';
-      inMemoryRegistrations[idx].installerDetails.proofPhoto = proofPhoto || '';
-      inMemoryRegistrations[idx].verification.status = 'Done';
+      if (idx !== -1) {
+        if (!inMemoryRegistrations[idx].installerDetails) inMemoryRegistrations[idx].installerDetails = {};
+        inMemoryRegistrations[idx].installerDetails.status = 'Completed';
+        inMemoryRegistrations[idx].installerDetails.completedAt = new Date();
+        inMemoryRegistrations[idx].installerDetails.serialNumbers = serialNumbers || '';
+        inMemoryRegistrations[idx].installerDetails.proofPhoto = proofPhoto || '';
+        if (!inMemoryRegistrations[idx].verification) inMemoryRegistrations[idx].verification = {};
+        inMemoryRegistrations[idx].verification.status = 'Done';
+        inMemoryRegistrations[idx].overallStatus = 'Installation_Complete';
+      }
       return res.json({ success: true, message: 'Installation marked Completed!', record: inMemoryRegistrations[idx] });
     }
   } catch (err) {
